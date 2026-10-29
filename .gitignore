@@ -1,0 +1,7 @@
+# Local state and generated files
+config.json
+SaveGuard.log
+*.zip
+
+# PowerShell
+*.tmp
