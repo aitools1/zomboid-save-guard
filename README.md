@@ -1,8 +1,14 @@
 # Zomboid Save Guard
 
+![Zomboid Save Guard menu](docs/menu.png)
+
+**Automatic backups for Project Zomboid saves on Windows.** A zip snapshot of the whole `Saves` folder at logon (or on demand), keeps the last 10 copies, one-click restore, no admin rights required.
+
+---
+
 Простая утилита для Windows, которая делает резервные копии сохранений **Project Zomboid** и умеет откатываться на любую из них.
 
-Зачем: B42 и моды регулярно ломают сейвы. Один неудачный мод — и 40 часов игры превращаются в труху. Save Guard делает zip-снимок папки `Saves` по расписанию и хранит последние N копий.
+Зачем: B42 и моды регулярно ломают сейвы. Один неудачный мод — и 40 часов игры превращаются в труху. Save Guard делает zip-снимок папки `Saves` при входе в систему (или вручную) и хранит последние N копий.
 
 ## Возможности
 
@@ -22,6 +28,10 @@
 Ставить ничего не нужно: это один `.ps1` файл.
 
 ## Запуск
+
+Самый простой способ: **двойной клик по `SaveGuard.bat`** — откроется меню.
+
+Или из PowerShell:
 
 ```powershell
 cd "путь\к\ZomboidSaveGuard"
