@@ -2,7 +2,7 @@
 
 ![Zomboid Save Guard menu](docs/menu.png)
 
-**Automatic backups for Project Zomboid saves on Windows.** A zip snapshot of the whole `Saves` folder at logon (or on demand), keeps the last 10 copies, one-click restore, no admin rights required.
+**Automatic backups for Project Zomboid saves on Windows.** A zip snapshot of the whole `Saves` folder at logon, every 2 hours, or on demand — keeps the last 10 copies, one-click restore, no admin rights required.
 
 ---
 

@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("menu", "backup", "list", "restore", "enable-autostart", "disable-autostart", "settings")]
+    [ValidateSet("menu", "backup", "list", "restore", "enable-autostart", "disable-autostart",
+                 "enable-task", "disable-task", "settings")]
     [string]$Action = "menu"
 )
 
@@ -9,6 +10,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference    = "SilentlyContinue"
+
+$ScriptVersion = "1.1.0"
+$TaskName      = "ZomboidSaveGuard"
 
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ConfigPath = Join-Path $ScriptDir "config.json"
@@ -62,6 +66,32 @@ function Get-BackupList($Config) {
         Sort-Object LastWriteTime -Descending)
 }
 
+function Test-TarAvailable {
+    [bool](Get-Command tar.exe -ErrorAction SilentlyContinue)
+}
+
+function New-ArchiveWithTar {
+    param(
+        [string]$ZipPath,
+        [string]$BaseDir,
+        [string[]]$Names
+    )
+
+    # -a lets tar pick the format from the .zip extension.
+    # Native stderr would trip $ErrorActionPreference = Stop, so relax it locally.
+    $argList = @("-a", "-cf", $ZipPath, "-C", $BaseDir) + $Names
+    $saved   = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & tar.exe @argList 2>&1 | Out-Null
+        $code = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $saved
+    }
+    return ($code -eq 0)
+}
+
 # ---------------------------------------------------------------- backup ----
 
 function Invoke-Backup {
@@ -70,6 +100,12 @@ function Invoke-Backup {
     if (-not (Test-Path $cfg.SavePath)) {
         throw "Save folder not found: $($cfg.SavePath). Edit $ConfigPath"
     }
+
+    if (Test-GameRunning) {
+        Write-Log "backup skipped: Project Zomboid is running"
+        throw "Project Zomboid is running. Close the game before making a backup."
+    }
+
     if (-not (Test-Path $cfg.BackupPath)) {
         New-Item -ItemType Directory -Path $cfg.BackupPath -Force | Out-Null
     }
@@ -78,20 +114,49 @@ function Invoke-Backup {
     $zip   = Join-Path $cfg.BackupPath "saves_$stamp.zip"
     $root  = Split-Path -Parent $cfg.SavePath
 
-    $items = @($cfg.SavePath)
+    # Names relative to $root, used by both archivers.
+    $names = @((Split-Path -Leaf $cfg.SavePath))
     if ($cfg.IncludeOptions) {
         foreach ($name in @("options.ini", "latestSave.ini")) {
-            $file = Join-Path $root $name
-            if (Test-Path $file) { $items += $file }
+            if (Test-Path (Join-Path $root $name)) { $names += $name }
         }
     }
 
-    Write-Host "Archiving $($cfg.SavePath) ..." -ForegroundColor DarkGray
-    Compress-Archive -Path $items -DestinationPath $zip -CompressionLevel Optimal -Force
+    $useTar = Test-TarAvailable
+    $tool   = if ($useTar) { "tar.exe" } else { "Compress-Archive" }
+    Write-Host "Archiving $($cfg.SavePath) with $tool ..." -ForegroundColor DarkGray
 
-    $size = Format-Size (Get-Item $zip).Length
+    try {
+        if ($useTar) {
+            if (-not (New-ArchiveWithTar -ZipPath $zip -BaseDir $root -Names $names)) {
+                throw "tar.exe exited with an error."
+            }
+        }
+        else {
+            $items = @($cfg.SavePath)
+            if ($cfg.IncludeOptions) {
+                foreach ($name in @("options.ini", "latestSave.ini")) {
+                    $file = Join-Path $root $name
+                    if (Test-Path $file) { $items += $file }
+                }
+            }
+            Compress-Archive -Path $items -DestinationPath $zip -CompressionLevel Optimal -Force
+        }
+
+        if (-not (Test-Path $zip)) { throw "Archive was not created." }
+        $length = (Get-Item $zip).Length
+        if ($length -eq 0) { throw "Archive is empty (0 bytes)." }
+    }
+    catch {
+        if (Test-Path $zip) { Remove-Item $zip -Force -ErrorAction SilentlyContinue }
+        Write-Log "backup failed, broken archive removed: $zip"
+        throw "Backup failed: $_"
+    }
+
+    # Rotation runs only after a verified, non-empty archive exists.
+    $size = Format-Size $length
     Write-Host "Backup created: $(Split-Path -Leaf $zip) ($size)" -ForegroundColor Green
-    Write-Log "backup $zip ($size)"
+    Write-Log "backup $zip ($size, $tool)"
 
     $all = Get-BackupList $cfg
     if ($all.Count -gt $cfg.KeepCount) {
@@ -235,29 +300,82 @@ function Disable-Autostart {
     Write-Log "autostart disabled"
 }
 
+# --------------------------------------------------------- scheduled task ----
+
+function Invoke-Schtasks {
+    param([string[]]$Arguments)
+
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & schtasks.exe @Arguments 2>&1 | Out-Null
+        return $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $saved
+    }
+}
+
+function Test-ScheduledBackup {
+    (Invoke-Schtasks @("/Query", "/TN", $TaskName)) -eq 0
+}
+
+function Enable-ScheduledBackup {
+    $script = Join-Path $ScriptDir "SaveGuard.ps1"
+    $action = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$script`" -Action backup"
+
+    $code = Invoke-Schtasks @("/Create", "/SC", "HOURLY", "/MO", "2", "/TN", $TaskName, "/TR", $action, "/F")
+    if ($code -ne 0) {
+        throw "Could not create the scheduled task (schtasks code $code). Try running PowerShell as administrator."
+    }
+
+    Write-Host "Scheduled backup enabled: every 2 hours (task '$TaskName')." -ForegroundColor Green
+    Write-Host "The task runs silently in the background while you are logged in." -ForegroundColor DarkGray
+    Write-Log "scheduled task enabled (every 2 hours)"
+}
+
+function Disable-ScheduledBackup {
+    if (-not (Test-ScheduledBackup)) {
+        Write-Host "Scheduled backup is not enabled." -ForegroundColor Yellow
+        return
+    }
+
+    $code = Invoke-Schtasks @("/Delete", "/TN", $TaskName, "/F")
+    if ($code -ne 0) {
+        throw "Could not delete the scheduled task (schtasks code $code)."
+    }
+
+    Write-Host "Scheduled backup disabled." -ForegroundColor Green
+    Write-Log "scheduled task disabled"
+}
+
 # ------------------------------------------------------------------ menu ----
 
 function Show-Menu {
-    $cfg = Get-Config
-    $list = Get-BackupList $cfg
-    $auto = Test-Autostart
+    $cfg   = Get-Config
+    $list  = Get-BackupList $cfg
+    $auto  = Test-Autostart
+    $sched = Test-ScheduledBackup
 
     Clear-Host
     Write-Host "======================================" -ForegroundColor Cyan
-    Write-Host "        Zomboid Save Guard" -ForegroundColor Cyan
+    Write-Host "     Zomboid Save Guard  v$ScriptVersion" -ForegroundColor Cyan
     Write-Host "======================================" -ForegroundColor Cyan
     Write-Host "Saves:    $($cfg.SavePath)"
     Write-Host "Backups:  $($cfg.BackupPath)"
     Write-Host "Stored:   $($list.Count) of $($cfg.KeepCount)"
     Write-Host "Autostart: $(if ($auto) { 'enabled' } else { 'disabled' })"
+    Write-Host "2h task:   $(if ($sched) { 'enabled' } else { 'disabled' })"
     Write-Host ""
     Write-Host "  1) Backup now"
     Write-Host "  2) List backups"
     Write-Host "  3) Restore backup"
     Write-Host "  4) Enable autostart (every logon)"
     Write-Host "  5) Disable autostart"
-    Write-Host "  6) Open settings"
-    Write-Host "  7) Open backup folder"
+    Write-Host "  6) Enable backup every 2 hours (Task Scheduler)"
+    Write-Host "  7) Disable 2-hour backup"
+    Write-Host "  8) Open settings"
+    Write-Host "  9) Open backup folder"
     Write-Host "  0) Exit"
     Write-Host ""
 }
@@ -272,8 +390,10 @@ function Start-Menu {
             "3" { try { Invoke-Restore } catch { Write-Host "ERROR: $_" -ForegroundColor Red }; Read-Host "Press Enter" }
             "4" { try { Enable-Autostart } catch { Write-Host "ERROR: $_" -ForegroundColor Red }; Read-Host "Press Enter" }
             "5" { try { Disable-Autostart } catch { Write-Host "ERROR: $_" -ForegroundColor Red }; Read-Host "Press Enter" }
-            "6" { $null = Get-Config; Start-Process notepad.exe $ConfigPath }
-            "7" { $c = Get-Config; if (Test-Path $c.BackupPath) { Start-Process explorer.exe $c.BackupPath } }
+            "6" { try { Enable-ScheduledBackup } catch { Write-Host "ERROR: $_" -ForegroundColor Red }; Read-Host "Press Enter" }
+            "7" { try { Disable-ScheduledBackup } catch { Write-Host "ERROR: $_" -ForegroundColor Red }; Read-Host "Press Enter" }
+            "8" { $null = Get-Config; Start-Process notepad.exe $ConfigPath }
+            "9" { $c = Get-Config; if (Test-Path $c.BackupPath) { Start-Process explorer.exe $c.BackupPath } }
             "0" { return }
             default { }
         }
@@ -288,6 +408,8 @@ switch ($Action) {
     "restore"           { Invoke-Restore }
     "enable-autostart"  { Enable-Autostart }
     "disable-autostart" { Disable-Autostart }
+    "enable-task"       { Enable-ScheduledBackup }
+    "disable-task"      { Disable-ScheduledBackup }
     "settings"          { $null = Get-Config; Start-Process notepad.exe $ConfigPath }
     "menu"              { Start-Menu }
 }
